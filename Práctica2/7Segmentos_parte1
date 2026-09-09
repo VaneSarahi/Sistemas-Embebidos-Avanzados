@@ -1,0 +1,77 @@
+/* Programming MAX7219 via SPI with FRDM-KL25Z */
+/* MAX7219 connected to a 4-digit 7-segment LED */
+/* PTD1 pin as SPI SCK */
+/* PTD2 pin as SPI MOSI */
+/* PTD0 pin as chip select */
+
+#include <MKL25Z4.H>
+
+void SPI0_init(void);
+void SPI0_write(unsigned char data);
+void max7219_write(unsigned char command, unsigned char data);
+
+#define DECODE 9
+#define INTENSITY 10
+#define SCANLIMIT 11
+#define SHUTDOWN 12
+#define TEST 15
+
+int main(void) {
+    SPI0_init(); /* enable SPI0 */
+
+    // 1. Modificación para 4 dígitos: DECODE
+    max7219_write(DECODE, 0x0F); /* 0x0F = 15. Habilita decodificación para los dígitos 0, 1, 2 y 3 */
+
+    // 2. Modificación para 4 dígitos: SCANLIMIT
+    max7219_write(SCANLIMIT, 3); /* El valor 3 escanea los dígitos 0, 1, 2, 3 (4 dígitos en total) */
+
+    max7219_write(INTENSITY, 4); /* set 1/4 intensity */
+
+    // 3. Modo Normal (Si necesitas depurar HW, cambia el 0 por un 1)
+    max7219_write(TEST, 0);      /* 0 = normal mode, 1 = test mode (enciende todos los segmentos) */
+
+    max7219_write(SHUTDOWN, 1);  /* enable device */
+
+    // 4. Mostrar 4 valores diferentes en los 4 displays
+    max7219_write(0x01, 0); /* display '1' on digit 0 (Registro 1) */
+    max7219_write(0x02, 0); /* display '2' on digit 1 (Registro 2) */
+    max7219_write(0x03, 0); /* display '3' on digit 2 (Registro 3) */
+    max7219_write(0x04, 0); /* display '4' on digit 4 (Registro 4) */
+
+    while(1) {
+        // Loop infinito
+    }
+}
+
+void SPI0_init(void) {
+    SIM->SCGC5 |= 0x1000;  /* enable clock to Port D */
+
+    PORTD->PCR[1] = 0x200; /* make PTD1 pin as SPI SCK */
+    PORTD->PCR[2] = 0x200; /* make PTD2 pin as SPI MOSI */
+    PORTD->PCR[0] = 0x100; /* make PTD0 pin as GPIO */
+    PTD->PDDR |= 0x01;     /* make PTD0 as output pin for CS */
+    PTD->PSOR = 0x01;      /* make PTD0 idle high */
+
+    SIM->SCGC4 |= 0x400000; /* enable clock to SPI0 */
+
+    SPI0->C1 = 0x10;       /* disable SPI and make SPI0 master */
+    SPI0->BR = 0x60;       /* set Baud rate to 1 MHz */
+    SPI0->C1 |= 0x40;      /* Enable SPI module */
+}
+
+void max7219_write(unsigned char command, unsigned char data) {
+    volatile char dummy;
+    PTD->PCOR = 1;         /* assert /CS (baja PTD0) */
+
+    while(!(SPI0->S & 0x20)) { } /* wait until tx ready */
+    SPI0->D = command;           /* send command byte first */
+    while(!(SPI0->S & 0x80)) { } /* wait tx complete */
+    dummy = SPI0->D;             /* clear SPRF */
+
+    while(!(SPI0->S & 0x20)) { } /* wait tx ready */
+    SPI0->D = data;              /* send data byte */
+    while(!(SPI0->S & 0x80)) { } /* wait tx complete */
+    dummy = SPI0->D;             /* clear SPRF */
+
+    PTD->PSOR = 1;               /* de-assert /CS (sube PTD0) */
+}
