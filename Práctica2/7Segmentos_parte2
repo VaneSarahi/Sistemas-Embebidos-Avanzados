@@ -1,0 +1,151 @@
+/* Contador de 4 dígitos con MAX7219 y KL25Z */
+
+
+#include <MKL25Z4.H>
+
+void SPI0_init(void);
+void max7219_write(unsigned char command, unsigned char data);
+void buttons_init(void);
+void display_number(int num);
+void delay_ms(int ms);
+
+#define DECODE 9
+#define SCANLIMIT 11
+#define INTENSITY 10
+#define SHUTDOWN 12
+#define TEST 15
+
+
+int current_count = 0;
+int is_playing = 0;      // 0 = Pausa, 1 = Play
+int is_incrementing = 1; // 1 = Incremento, 0 = Decremento
+
+uint32_t time_counter = 0;
+const uint32_t COUNTER_SPEED = 50;
+int main(void) {
+    SPI0_init();
+    buttons_init();
+
+    max7219_write(DECODE, 0x0F);
+    max7219_write(SCANLIMIT, 3);
+    max7219_write(INTENSITY, 4);
+    max7219_write(TEST, 0);
+    max7219_write(SHUTDOWN, 1);
+
+
+    uint8_t prev_b1 = 1, prev_b2 = 1, prev_b3 = 1, prev_b4 = 1;
+
+    while(1) {
+        uint8_t curr_b1 = (PTA->PDIR & (1 << 1)) ? 1 : 0; // Play/Pause
+        uint8_t curr_b2 = (PTA->PDIR & (1 << 2)) ? 1 : 0; // Modo Inc/Dec
+        uint8_t curr_b3 = (PTA->PDIR & (1 << 4)) ? 1 : 0; // Ajuste manual
+        uint8_t curr_b4 = (PTA->PDIR & (1 << 5)) ? 1 : 0; // Reset
+
+        if (curr_b1 == 0 && prev_b1 == 1) {
+            is_playing = !is_playing;
+        }
+
+        if (curr_b2 == 0 && prev_b2 == 1) {
+            is_incrementing = !is_incrementing;
+        }
+
+        if (curr_b3 == 0 && prev_b3 == 1) {
+            if (!is_playing) {
+                if (is_incrementing) current_count++;
+                else current_count--;
+            }
+        }
+
+        // d) Reset
+        if (curr_b4 == 0 && prev_b4 == 1) {
+            if (is_incrementing) current_count = 0;
+            else current_count = 9999;
+        }
+
+        prev_b1 = curr_b1;
+        prev_b2 = curr_b2;
+        prev_b3 = curr_b3;
+        prev_b4 = curr_b4;
+
+
+        if (current_count > 9999) current_count = 0;
+        if (current_count < 0) current_count = 9999;
+
+
+        display_number(current_count);
+
+        if (is_playing) {
+            time_counter++;
+            if (time_counter >= COUNTER_SPEED) {
+                time_counter = 0;
+                if (is_incrementing) current_count++;
+                else current_count--;
+            }
+        }
+
+        delay_ms(10);
+    }
+}
+
+
+void display_number(int num) {
+    int unidades = num % 10;
+    int decenas  = (num / 10) % 10;
+    int centenas = (num / 100) % 10;
+    int millares = (num / 1000) % 10;
+
+    max7219_write(4, unidades);
+    max7219_write(3, decenas);
+    max7219_write(2, centenas);
+    max7219_write(1, millares);
+}
+
+
+void buttons_init(void) {
+    SIM->SCGC5 |= 0x0200;
+
+    PORTA->PCR[1] = 0x103;
+    PORTA->PCR[2] = 0x103;
+    PORTA->PCR[4] = 0x103;
+    PORTA->PCR[5] = 0x103;
+
+    PTA->PDDR &= ~((1 << 1) | (1 << 2) | (1 << 4) | (1 << 5));
+}
+
+void SPI0_init(void) {
+    SIM->SCGC5 |= 0x1000;
+    PORTD->PCR[1] = 0x200;
+    PORTD->PCR[2] = 0x200;
+    PORTD->PCR[0] = 0x100;
+    PTD->PDDR |= 0x01;
+    PTD->PSOR = 0x01;
+    SIM->SCGC4 |= 0x400000;
+    SPI0->C1 = 0x10;
+    SPI0->BR = 0x60;
+    SPI0->C1 |= 0x40;
+}
+
+// Tu función de escritura SPI existente
+void max7219_write(unsigned char command, unsigned char data) {
+    volatile char dummy;
+    PTD->PCOR = 1;
+    while(!(SPI0->S & 0x20)) { }
+    SPI0->D = command;
+    while(!(SPI0->S & 0x80)) { }
+    dummy = SPI0->D;
+    while(!(SPI0->S & 0x20)) { }
+    SPI0->D = data;
+    while(!(SPI0->S & 0x80)) { }
+    dummy = SPI0->D;
+    PTD->PSOR = 1;
+}
+
+// Retardo por software simple
+void delay_ms(int ms) {
+    int i, j;
+    for (i = 0; i < ms; i++) {
+        for (j = 0; j < 3000; j++) {
+            __asm("nop");
+        }
+    }
+}
