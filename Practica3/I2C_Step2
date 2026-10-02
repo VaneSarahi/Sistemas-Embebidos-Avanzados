@@ -1,0 +1,665 @@
+// Step 2: SPI Display with MAX7219
+
+#include "MKL25Z4.h"
+#include <stdint.h>
+#include <stdio.h>
+
+#define LCD_RS_PIN      1
+#define LCD_EN_PIN      2
+
+#define LCD_D4_PIN      0
+#define LCD_D5_PIN      1
+#define LCD_D6_PIN      2
+#define LCD_D7_PIN      3
+
+#define DS3231_I2C_ADDR    0x68
+#define I2C_TIMEOUT        100000U
+
+#define DS3231_REG_CONTROL 0x0E
+#define DS3231_REG_STATUS  0x0F
+#define SET_TIME_ON_BOOT   1
+
+// MAX7219
+#define MAX_CS_PIN          0       
+
+#define MAX_REG_NOOP        0x00
+#define MAX_REG_DIGIT0      0x01    
+#define MAX_REG_DECODE      0x09
+#define MAX_REG_INTENSITY   0x0A
+#define MAX_REG_SCANLIMIT   0x0B
+#define MAX_REG_SHUTDOWN    0x0C
+#define MAX_REG_TEST        0x0F
+
+#define MAX_NUM_DIGITS      4
+#define MAX_BLANK           0x0F    
+#define MAX_DP              0x80    
+
+#define MAX_REVERSE_DIGITS  0
+
+typedef struct
+{
+    uint8_t seconds;
+    uint8_t minutes;
+    uint8_t hours;
+    uint8_t day;
+    uint8_t month;
+    uint8_t year;
+} DateTime;
+
+//DELAYS
+
+void Delay_us(uint32_t us)
+{
+    uint32_t i, j;
+
+    for (i = 0; i < us; i++)
+    {
+        for (j = 0; j < 8; j++)
+        {
+            __NOP();
+        }
+    }
+}
+
+void Delay_ms(uint32_t ms)
+{
+    uint32_t i;
+
+    for (i = 0; i < ms; i++)
+    {
+        Delay_us(1000);
+    }
+}
+
+// LCD
+
+void LCD_GPIO_Init(void)
+{
+    SIM->SCGC5 |= SIM_SCGC5_PORTA_MASK;
+    SIM->SCGC5 |= SIM_SCGC5_PORTC_MASK;
+
+    PORTA->PCR[LCD_RS_PIN] = PORT_PCR_MUX(1);
+    PORTA->PCR[LCD_EN_PIN] = PORT_PCR_MUX(1);
+
+    PORTC->PCR[LCD_D4_PIN] = PORT_PCR_MUX(1);
+    PORTC->PCR[LCD_D5_PIN] = PORT_PCR_MUX(1);
+    PORTC->PCR[LCD_D6_PIN] = PORT_PCR_MUX(1);
+    PORTC->PCR[LCD_D7_PIN] = PORT_PCR_MUX(1);
+
+    PTA->PDDR |= (1 << LCD_RS_PIN);
+    PTA->PDDR |= (1 << LCD_EN_PIN);
+
+    PTC->PDDR |= (1 << LCD_D4_PIN);
+    PTC->PDDR |= (1 << LCD_D5_PIN);
+    PTC->PDDR |= (1 << LCD_D6_PIN);
+    PTC->PDDR |= (1 << LCD_D7_PIN);
+
+    PTA->PCOR = (1 << LCD_RS_PIN) | (1 << LCD_EN_PIN);
+
+    PTC->PCOR = (1 << LCD_D4_PIN) |
+                (1 << LCD_D5_PIN) |
+                (1 << LCD_D6_PIN) |
+                (1 << LCD_D7_PIN);
+}
+
+void LCD_WriteDataPins(uint8_t value)
+{
+    PTC->PCOR = (1 << LCD_D4_PIN) |
+                (1 << LCD_D5_PIN) |
+                (1 << LCD_D6_PIN) |
+                (1 << LCD_D7_PIN);
+
+    if (value & 0x01) PTC->PSOR = (1 << LCD_D4_PIN);
+    if (value & 0x02) PTC->PSOR = (1 << LCD_D5_PIN);
+    if (value & 0x04) PTC->PSOR = (1 << LCD_D6_PIN);
+    if (value & 0x08) PTC->PSOR = (1 << LCD_D7_PIN);
+}
+
+void LCD_EnablePulse(void)
+{
+    PTA->PSOR = (1 << LCD_EN_PIN);
+    Delay_us(2);
+    PTA->PCOR = (1 << LCD_EN_PIN);
+    Delay_us(50);
+}
+
+void LCD_Send4Bits(uint8_t value)
+{
+    LCD_WriteDataPins(value & 0x0F);
+    LCD_EnablePulse();
+}
+
+void LCD_SendCommand(uint8_t command)
+{
+    PTA->PCOR = (1 << LCD_RS_PIN);          // RS = 0 -> comando 
+
+    LCD_Send4Bits(command >> 4);
+    LCD_Send4Bits(command & 0x0F);
+
+    if ((command == 0x01) || (command == 0x02))
+    {
+        Delay_ms(2);
+    }
+    else
+    {
+        Delay_us(50);
+    }
+}
+
+void LCD_SendData(uint8_t data)
+{
+    PTA->PSOR = (1 << LCD_RS_PIN);          // RS = 1 -> dato 
+
+    LCD_Send4Bits(data >> 4);
+    LCD_Send4Bits(data & 0x0F);
+}
+
+void LCD_WriteChar(char c)
+{
+    LCD_SendData((uint8_t)c);
+}
+
+void LCD_WriteString(const char *str)
+{
+    while (*str != '\0')
+    {
+        LCD_WriteChar(*str);
+        str++;
+    }
+}
+
+void LCD_SetCursor(uint8_t row, uint8_t column)
+{
+    uint8_t address;
+
+    if (row == 0)
+    {
+        address = 0x00 + column;
+    }
+    else
+    {
+        address = 0x40 + column;
+    }
+
+    LCD_SendCommand(0x80 | address);
+}
+
+void LCD_Clear(void)
+{
+    LCD_SendCommand(0x01);
+    Delay_ms(2);
+}
+
+void LCD_Init(void)
+{
+    LCD_GPIO_Init();
+
+    Delay_ms(40);
+
+    PTA->PCOR = (1 << LCD_RS_PIN);
+    PTA->PCOR = (1 << LCD_EN_PIN);
+
+    // Secuencia de inicializacion: modo de 4 bits 
+    LCD_Send4Bits(0x03);
+    Delay_ms(5);
+    LCD_Send4Bits(0x03);
+    Delay_us(150);
+    LCD_Send4Bits(0x03);
+    Delay_us(150);
+    LCD_Send4Bits(0x02);
+    Delay_us(150);
+
+    LCD_SendCommand(0x28);   
+    LCD_SendCommand(0x0C);   
+    LCD_SendCommand(0x06);   
+    LCD_SendCommand(0x01);   
+    Delay_ms(2);
+}
+
+
+#define SCL_LOW()    do { PTC->PCOR = (1u << 8); PTC->PDDR |=  (1u << 8); } while (0)
+#define SCL_HIGH()   do { PTC->PDDR &= ~(1u << 8); } while (0)
+#define SDA_LOW()    do { PTC->PCOR = (1u << 9); PTC->PDDR |=  (1u << 9); } while (0)
+#define SDA_HIGH()   do { PTC->PDDR &= ~(1u << 9); } while (0)
+#define SDA_READ()   ((PTC->PDIR >> 9) & 1u)
+
+static void I2C_BusRecover(void)
+{
+    uint8_t i;
+
+    SIM->SCGC5 |= SIM_SCGC5_PORTC_MASK;
+
+    PORTC->PCR[8] = PORT_PCR_MUX(1) | PORT_PCR_PE_MASK | PORT_PCR_PS_MASK;
+    PORTC->PCR[9] = PORT_PCR_MUX(1) | PORT_PCR_PE_MASK | PORT_PCR_PS_MASK;
+
+    SCL_HIGH();
+    SDA_HIGH();
+    Delay_us(20);
+
+    for (i = 0; i < 9; i++)
+    {
+        if (SDA_READ()) break;
+
+        SCL_LOW();
+        Delay_us(20);
+        SCL_HIGH();
+        Delay_us(20);
+    }
+
+    // STOP: SDA sube mientras SCL esta en alto 
+    SDA_LOW();
+    Delay_us(20);
+    SCL_HIGH();
+    Delay_us(20);
+    SDA_HIGH();
+    Delay_us(20);
+}
+
+void I2C0_Init(void)
+{
+    SIM->SCGC4 |= SIM_SCGC4_I2C0_MASK;
+    SIM->SCGC5 |= SIM_SCGC5_PORTC_MASK | SIM_SCGC5_PORTE_MASK;
+
+    I2C0->C1 = 0x00;                  
+
+    PORTE->PCR[24] = PORT_PCR_MUX(0);
+    PORTE->PCR[25] = PORT_PCR_MUX(0);
+
+    I2C_BusRecover();
+
+    PORTC->PCR[8] = PORT_PCR_MUX(2) | PORT_PCR_PE_MASK | PORT_PCR_PS_MASK;
+    PORTC->PCR[9] = PORT_PCR_MUX(2) | PORT_PCR_PE_MASK | PORT_PCR_PS_MASK;
+
+    I2C0->F  = 0x1F;                  // ~100 kHz con bus de 24 MHz 
+    I2C0->C1 = I2C_C1_IICEN_MASK;
+
+    I2C0->S = I2C_S_IICIF_MASK | I2C_S_ARBL_MASK;   /* w1c */
+}
+
+static uint8_t I2C_WaitIICIF(void)
+{
+    uint32_t t = I2C_TIMEOUT;
+
+    while ((I2C0->S & I2C_S_IICIF_MASK) == 0)
+    {
+        if (--t == 0) return 0;
+    }
+
+    I2C0->S = I2C_S_IICIF_MASK;       /* w1c */
+    return 1;
+}
+
+static uint8_t I2C_WaitBusIdle(void)
+{
+    uint32_t t = I2C_TIMEOUT;
+
+    while (I2C0->S & I2C_S_BUSY_MASK)
+    {
+        if (--t == 0) return 0;
+    }
+
+    return 1;
+}
+
+static uint8_t I2C_Start(void)
+{
+    if (I2C0->S & I2C_S_ARBL_MASK)
+    {
+        I2C0->S = I2C_S_ARBL_MASK;
+    }
+
+    if (!I2C_WaitBusIdle())
+    {
+        I2C0_Init();                  // bus trabado: reiniciar periferico 
+        if (!I2C_WaitBusIdle()) return 0;
+    }
+
+    I2C0->C1 |= I2C_C1_TX_MASK;       // transmitir 
+    I2C0->C1 |= I2C_C1_MST_MASK;      // MST 0 -> 1 genera START 
+    return 1;
+}
+
+static void I2C_Stop(void)
+{
+    I2C0->C1 &= ~(I2C_C1_MST_MASK | I2C_C1_TX_MASK | I2C_C1_TXAK_MASK);
+    I2C_WaitBusIdle();
+}
+
+static uint8_t I2C_WriteByte(uint8_t data)
+{
+    I2C0->D = data;
+
+    if (!I2C_WaitIICIF()) return 0;
+
+    if (I2C0->S & I2C_S_RXAK_MASK) return 0;   
+
+    return 1;
+}
+
+static uint8_t I2C_ReadBytes(uint8_t *buf, uint8_t len)
+{
+    uint8_t i;
+
+    I2C0->C1 &= ~I2C_C1_TX_MASK;                 
+
+    if (len == 1)
+        I2C0->C1 |= I2C_C1_TXAK_MASK;            // NACK al unico byte 
+    else
+        I2C0->C1 &= ~I2C_C1_TXAK_MASK;           // ACK 
+
+    (void)I2C0->D;                               
+
+    for (i = 0; i < len; i++)
+    {
+        if (!I2C_WaitIICIF())
+        {
+            I2C_Stop();
+            return 0;
+        }
+
+        if ((len >= 2) && (i == (uint8_t)(len - 2)))
+        {
+            I2C0->C1 |= I2C_C1_TXAK_MASK;        
+        }
+
+        if (i == (uint8_t)(len - 1))
+        {
+            /* Ultimo byte: STOP ANTES de leer D */
+            I2C0->C1 &= ~(I2C_C1_MST_MASK | I2C_C1_TXAK_MASK);
+            buf[i] = I2C0->D;
+            I2C_WaitBusIdle();
+        }
+        else
+        {
+            buf[i] = I2C0->D;
+        }
+    }
+
+    return 1;
+}
+
+static uint8_t I2C_Probe(uint8_t addr7)
+{
+    uint8_t ok;
+
+    if (!I2C_Start()) return 0;
+
+    ok = I2C_WriteByte((uint8_t)(addr7 << 1));
+    I2C_Stop();
+
+    return ok;
+}
+
+
+uint8_t BCD_To_Decimal(uint8_t bcd)
+{
+    return ((bcd >> 4) * 10) + (bcd & 0x0F);
+}
+
+uint8_t Decimal_To_BCD(uint8_t decimal)
+{
+    return ((decimal / 10) << 4) | (decimal % 10);
+}
+
+//Condiguracion DS3231
+
+uint8_t DS3231_WriteRegisters(uint8_t reg, const uint8_t *data, uint8_t len)
+{
+    uint8_t i;
+
+    if (!I2C_Start()) return 0;
+
+    if (!I2C_WriteByte(DS3231_I2C_ADDR << 1)) { I2C_Stop(); return 0; }
+    if (!I2C_WriteByte(reg))                  { I2C_Stop(); return 0; }
+
+    for (i = 0; i < len; i++)
+    {
+        if (!I2C_WriteByte(data[i])) { I2C_Stop(); return 0; }
+    }
+
+    I2C_Stop();
+    return 1;
+}
+
+uint8_t DS3231_ReadRegisters(uint8_t reg, uint8_t *buf, uint8_t len)
+{
+    if (!I2C_Start()) return 0;
+
+    if (!I2C_WriteByte(DS3231_I2C_ADDR << 1)) { I2C_Stop(); return 0; }
+    if (!I2C_WriteByte(reg))                  { I2C_Stop(); return 0; }
+
+    I2C0->C1 |= I2C_C1_RSTA_MASK;             
+
+    if (!I2C_WriteByte((DS3231_I2C_ADDR << 1) | 1)) { I2C_Stop(); return 0; }
+
+    return I2C_ReadBytes(buf, len);
+}
+
+// Enciende el oscilador, desactiva alarmas y limpia la bandera OSF.
+uint8_t DS3231_Init(void)
+{
+    uint8_t control = 0x1C;   
+    uint8_t status  = 0x00;   
+
+    if (!DS3231_WriteRegisters(DS3231_REG_CONTROL, &control, 1)) return 0;
+    if (!DS3231_WriteRegisters(DS3231_REG_STATUS,  &status,  1)) return 0;
+
+    return 1;
+}
+
+uint8_t DS3231_SetDateTime(const DateTime *dt)
+{
+    uint8_t regs[7];
+
+    regs[0] = Decimal_To_BCD(dt->seconds);    // 0x00 segundos 
+    regs[1] = Decimal_To_BCD(dt->minutes);    // 0x01 minutos 
+    regs[2] = Decimal_To_BCD(dt->hours);      // 0x02 horas (24 h) 
+    regs[3] = 1;                              // 0x03 dia de la semana 
+    regs[4] = Decimal_To_BCD(dt->day);        // 0x04 fecha 
+    regs[5] = Decimal_To_BCD(dt->month);      // 0x05 mes 
+    regs[6] = Decimal_To_BCD(dt->year);       // 0x06 año
+
+    return DS3231_WriteRegisters(0x00, regs, 7);
+}
+
+uint8_t DS3231_ReadDateTime(DateTime *dt)
+{
+    uint8_t regs[7];
+
+    if (!DS3231_ReadRegisters(0x00, regs, 7)) return 0;
+
+    dt->seconds = BCD_To_Decimal(regs[0] & 0x7F);
+    dt->minutes = BCD_To_Decimal(regs[1] & 0x7F);
+    dt->hours   = BCD_To_Decimal(regs[2] & 0x3F);
+    dt->day     = BCD_To_Decimal(regs[4] & 0x3F);
+    dt->month   = BCD_To_Decimal(regs[5] & 0x1F);   
+    dt->year    = BCD_To_Decimal(regs[6]);
+
+    return 1;
+}
+// Funciones SPI0
+void SPI0_Init(void)
+{
+    SIM->SCGC4 |= SIM_SCGC4_SPI0_MASK;
+    SIM->SCGC5 |= SIM_SCGC5_PORTD_MASK;
+
+    PORTD->PCR[1] = PORT_PCR_MUX(2);              /* SPI0_SCK  */
+    PORTD->PCR[2] = PORT_PCR_MUX(2);              /* SPI0_MOSI */
+
+    PORTD->PCR[MAX_CS_PIN] = PORT_PCR_MUX(1);
+    PTD->PSOR  = (1u << MAX_CS_PIN);              // CS en alto (inactivo) 
+    PTD->PDDR |= (1u << MAX_CS_PIN);
+
+    SPI0->C1 = 0x00;                              
+    SPI0->C2 = 0x00;
+    SPI0->BR = SPI_BR_SPPR(2) | SPI_BR_SPR(1);    // 24 MHz / 12 = 2 MHz 
+    SPI0->C1 = SPI_C1_SPE_MASK | SPI_C1_MSTR_MASK;
+}
+
+uint8_t SPI0_Transfer(uint8_t data)
+{
+    while ((SPI0->S & SPI_S_SPTEF_MASK) == 0) {}  // buffer de TX libre 
+    SPI0->D = data;
+
+    while ((SPI0->S & SPI_S_SPRF_MASK) == 0) {}   // byte completo 
+    return SPI0->D;                               // leer limpia SPRF 
+}
+
+//Funciones MAX7219
+
+void MAX7219_Write(uint8_t reg, uint8_t value)
+{
+    PTD->PCOR = (1u << MAX_CS_PIN);               
+
+    (void)SPI0_Transfer(reg);
+    (void)SPI0_Transfer(value);
+
+    PTD->PSOR = (1u << MAX_CS_PIN);               // LOAD = 1 -> latch 
+}
+
+static uint8_t MAX7219_DigitReg(uint8_t pos)     // pos 0 = izquierda 
+{
+#if MAX_REVERSE_DIGITS
+    return (uint8_t)(MAX_REG_DIGIT0 + (MAX_NUM_DIGITS - 1 - pos));
+#else
+    return (uint8_t)(MAX_REG_DIGIT0 + pos);
+#endif
+}
+
+void MAX7219_Clear(void)
+{
+    uint8_t i;
+
+    for (i = 0; i < MAX_NUM_DIGITS; i++)
+    {
+        MAX7219_Write(MAX7219_DigitReg(i), MAX_BLANK);
+    }
+}
+
+void MAX7219_Init(void)
+{
+    SPI0_Init();
+
+    MAX7219_Write(MAX_REG_SHUTDOWN,  0x00);       // apagado mientras se configura 
+    MAX7219_Write(MAX_REG_TEST,      0x00);       // modo prueba OFF 
+    MAX7219_Write(MAX_REG_SCANLIMIT, MAX_NUM_DIGITS - 1);   
+    MAX7219_Write(MAX_REG_DECODE,    0x0F);       
+    MAX7219_Write(MAX_REG_INTENSITY, 0x08);       
+
+    MAX7219_Clear();
+
+    MAX7219_Write(MAX_REG_SHUTDOWN,  0x01);       
+}
+
+void MAX7219_ShowTime(uint8_t hours, uint8_t minutes, uint8_t sep)
+{
+    uint8_t d[MAX_NUM_DIGITS];
+    uint8_t i;
+
+    d[0] = hours   / 10;
+    d[1] = hours   % 10;
+    d[2] = minutes / 10;
+    d[3] = minutes % 10;
+
+    if (sep) d[1] |= MAX_DP;
+
+    for (i = 0; i < MAX_NUM_DIGITS; i++)
+    {
+        MAX7219_Write(MAX7219_DigitReg(i), d[i]);
+    }
+}
+
+int main(void)
+{
+    DateTime dt;
+    char buffer1[17];
+    char buffer2[17];
+    uint8_t lastSec = 0xFF;
+
+    LCD_Init();
+    LCD_SetCursor(0, 0);
+    LCD_WriteString("Paso 2: MAX7219");
+
+    MAX7219_Init();
+    I2C0_Init();
+
+//Prueba de verificacion
+    while (!I2C_Probe(DS3231_I2C_ADDR))
+    {
+        LCD_Clear();
+        LCD_SetCursor(0, 0);
+        LCD_WriteString("DS3231 NO ACK");
+        LCD_SetCursor(1, 0);
+        LCD_WriteString("Revisa SDA/SCL");
+        Delay_ms(1000);
+        I2C0_Init();
+    }
+
+    LCD_Clear();
+    LCD_SetCursor(0, 0);
+    LCD_WriteString("DS3231 OK 0x68");
+    Delay_ms(1000);
+
+    // 2) Inicializar el RTC 
+    if (!DS3231_Init())
+    {
+        LCD_Clear();
+        LCD_SetCursor(0, 0);
+        LCD_WriteString("INIT ERROR");
+        while (1) {}
+    }
+
+#if SET_TIME_ON_BOOT
+    // Fecha y hora inicial 
+    dt.day     = 1;
+    dt.month   = 10;
+    dt.year    = 26;
+    dt.hours   = 18;
+    dt.minutes = 21;
+    dt.seconds = 50;
+
+    if (!DS3231_SetDateTime(&dt))
+    {
+        LCD_Clear();
+        LCD_SetCursor(0, 0);
+        LCD_WriteString("SET ERROR");
+        while (1) {}
+    }
+#endif
+
+    LCD_Clear();
+
+    while (1)
+    {
+        if (!DS3231_ReadDateTime(&dt))
+        {
+            LCD_SetCursor(0, 0);
+            LCD_WriteString("READ ERROR      ");
+            LCD_SetCursor(1, 0);
+            LCD_WriteString("                ");
+            I2C0_Init();                 // intentar recuperar el bus 
+            lastSec = 0xFF;
+            Delay_ms(500);
+            continue;
+        }
+
+        if (dt.seconds != lastSec)
+        {
+            lastSec = dt.seconds;
+            MAX7219_ShowTime(dt.hours, dt.minutes, (uint8_t)(dt.seconds & 1u));
+
+            snprintf(buffer1, sizeof(buffer1), "Date: %02u/%02u/%02u  ",
+                     (unsigned)dt.day, (unsigned)dt.month, (unsigned)dt.year);
+            snprintf(buffer2, sizeof(buffer2), "Time: %02u:%02u:%02u  ",
+                     (unsigned)dt.hours, (unsigned)dt.minutes, (unsigned)dt.seconds);
+
+            LCD_SetCursor(0, 0);
+            LCD_WriteString(buffer1);
+
+            LCD_SetCursor(1, 0);
+            LCD_WriteString(buffer2);
+        }
+
+        Delay_ms(100);
+    }
+}
