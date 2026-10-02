@@ -1,0 +1,722 @@
+#include "MKL25Z4.h"
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+/* ============================================================
+ *  Practica 3 - Paso 6 + EXTRA CHALLENGE 3 (Temp Threshold)
+ * ============================================================
+ *  LCD    : RS PTA1, EN PTA2, D4-D7 PTC0-PTC3
+ *  DS3231 : SCL PTC8, SDA PTC9, INT/SQW -> PTD4
+ *  MAX7219: CS PTD0, CLK PTD1, DIN PTD2
+ *  Keypad : filas PTB0-PTB3, columnas PTB8-PTB11
+ *  Buzzer : PTC11      LED rojo de la placa: PTB18
+ *  Temp   : Potenciómetro en PTE20 (ADC0)
+ * ============================================================ */
+
+#define LCD_RS_PIN      1
+#define LCD_EN_PIN      2
+#define LCD_D4_PIN      0
+#define LCD_D5_PIN      1
+#define LCD_D6_PIN      2
+#define LCD_D7_PIN      3
+
+#define DS3231_I2C_ADDR    0x68
+#define I2C_TIMEOUT        100000U
+
+#define DS3231_REG_CONTROL 0x0E
+#define DS3231_REG_STATUS  0x0F
+
+/* ---------- MAX7219 ---------- */
+#define MAX_CS_PIN         0
+#define MAX_REG_DIGIT0     0x01
+#define MAX_REG_DECODE     0x09
+#define MAX_REG_INTENSITY  0x0A
+#define MAX_REG_SCANLIMIT  0x0B
+#define MAX_REG_SHUTDOWN   0x0C
+#define MAX_REG_TEST       0x0F
+#define MAX_NUM_DIGITS     4
+#define MAX_BLANK          0x0F
+#define MAX_DP             0x80
+
+/* ---------- KEYPAD ---------- */
+#define KP_ROW0_PIN        0      /* PTB0..PTB3  = filas */
+#define KP_COL0_PIN        8      /* PTB8..PTB11 = columnas */
+
+/* ---------- ALARM & ACTUATORS ---------- */
+#define ALARM_INT_PIN      4      /* PTD4 - INT/SQW del DS3231 */
+#define BUZZER_PIN         11     /* PTC11 */
+#define LED_ALARM_PIN      18     /* PTB18 - LED rojo */
+
+/* Rango de la temperatura simulada (en décimas de grado) */
+#define TEMP_MIN_X10   150    /* 15.0 °C con el potenciómetro en 0 V   */
+#define TEMP_MAX_X10   400    /* 40.0 °C con el potenciómetro en 3.3 V */
+
+/* ---------- MODOS DEL SISTEMA ---------- */
+typedef enum {
+    MODE_NORMAL = 0,
+    MODE_MENU,
+    MODE_CONFIG_TIME,
+    MODE_CONFIG_DATE,
+    MODE_CONFIG_ALARM,
+    MODE_CONFIG_TEMP_LIMIT,  /* NUEVO: Estado para configurar límite de temperatura */
+    MODE_ALARM_TRIGGERED
+} SystemMode;
+
+typedef struct
+{
+    uint8_t seconds;
+    uint8_t minutes;
+    uint8_t hours;
+    uint8_t day;
+    uint8_t month;
+    uint8_t year;
+} DateTime;
+
+/* Variables globales de estado */
+SystemMode currentMode = MODE_NORMAL;
+char inputBuffer[10];
+uint8_t bufferIndex = 0;
+
+uint8_t alarmHours = 7;
+uint8_t alarmMinutes = 30;
+volatile uint8_t alarmFiredFlag = 0;
+uint8_t alarmEnabled = 1;
+
+/* Variable para el Extra Challenge 3 */
+uint8_t tempLimit = 35; /* Límite de temperatura por defecto (35 °C) */
+
+/* Prototipos */
+void Delay_ms(uint32_t ms);
+void Delay_us(uint32_t us);
+void LCD_Init(void);
+void LCD_Clear(void);
+void LCD_WriteString(const char *str);
+void LCD_SetCursor(uint8_t row, uint8_t column);
+void LCD_WriteLine(uint8_t row, const char *s);
+void I2C0_Init(void);
+uint8_t DS3231_Init(void);
+uint8_t DS3231_ReadDateTime(DateTime *dt);
+uint8_t DS3231_SetDateTime(const DateTime *dt);
+uint8_t DS3231_SetAlarm1(uint8_t hours, uint8_t minutes);
+uint8_t DS3231_WriteRegisters(uint8_t reg, const uint8_t *data, uint8_t len);
+uint8_t DS3231_ReadRegisters(uint8_t reg, uint8_t *buf, uint8_t len);
+void MAX7219_Init(void);
+void MAX7219_ShowTime(uint8_t hours, uint8_t minutes, uint8_t sep);
+
+/* ============================================================
+ *                    ALARMA Y GPIOs
+ * ============================================================ */
+void Alarm_Hardware_Init(void)
+{
+    SIM->SCGC5 |= SIM_SCGC5_PORTB_MASK | SIM_SCGC5_PORTC_MASK | SIM_SCGC5_PORTD_MASK;
+
+    PORTB->PCR[LED_ALARM_PIN] = PORT_PCR_MUX(1);
+    PTB->PSOR  = (1u << LED_ALARM_PIN);
+    PTB->PDDR |= (1u << LED_ALARM_PIN);
+
+    PORTC->PCR[BUZZER_PIN] = PORT_PCR_MUX(1);
+    PTC->PCOR  = (1u << BUZZER_PIN);
+    PTC->PDDR |= (1u << BUZZER_PIN);
+
+    PORTD->PCR[ALARM_INT_PIN] = PORT_PCR_MUX(1) | PORT_PCR_PE_MASK | PORT_PCR_PS_MASK | PORT_PCR_IRQC(0x0A);
+    PTD->PDDR &= ~(1u << ALARM_INT_PIN);
+    PORTD->ISFR = (1u << ALARM_INT_PIN);
+
+    NVIC_ClearPendingIRQ(PORTD_IRQn);
+    NVIC_SetPriority(PORTD_IRQn, 2);
+    NVIC_EnableIRQ(PORTD_IRQn);
+}
+
+void PORTD_IRQHandler(void)
+{
+    if (PORTD->ISFR & (1u << ALARM_INT_PIN))
+    {
+        PORTD->ISFR = (1u << ALARM_INT_PIN);
+        alarmFiredFlag = 1;
+    }
+}
+
+uint8_t DS3231_SetAlarm1(uint8_t hours, uint8_t minutes)
+{
+    uint8_t regs[4];
+    uint8_t control;
+    uint8_t status;
+
+    regs[0] = 0x00;
+    regs[1] = ((minutes / 10) << 4) | (minutes % 10);
+    regs[2] = ((hours / 10) << 4) | (hours % 10);
+    regs[3] = 0x80;
+
+    if (!DS3231_WriteRegisters(0x07, regs, 4)) return 0;
+    if (!DS3231_ReadRegisters(DS3231_REG_CONTROL, &control, 1)) return 0;
+
+    if (alarmEnabled) control |= 0x05;
+    else control &= ~0x01;
+
+    if (!DS3231_WriteRegisters(DS3231_REG_CONTROL, &control, 1)) return 0;
+    if (!DS3231_ReadRegisters(DS3231_REG_STATUS, &status, 1)) return 0;
+    status &= ~0x01;
+    if (!DS3231_WriteRegisters(DS3231_REG_STATUS, &status, 1)) return 0;
+
+    return 1;
+}
+
+/* ============================================================
+ *                    TECLADO MATRICIAL
+ * ============================================================ */
+void Keypad_Init(void)
+{
+    SIM->SCGC5 |= SIM_SCGC5_PORTB_MASK;
+    for (int i = 0; i < 4; i++) {
+        PORTB->PCR[KP_ROW0_PIN + i] = PORT_PCR_MUX(1);
+        PTB->PSOR  = (1u << (KP_ROW0_PIN + i));
+        PTB->PDDR |= (1u << (KP_ROW0_PIN + i));
+    }
+    for (int i = 0; i < 4; i++) {
+        PORTB->PCR[KP_COL0_PIN + i] = PORT_PCR_MUX(1) | PORT_PCR_PE_MASK | PORT_PCR_PS_MASK;
+        PTB->PDDR &= ~(1u << (KP_COL0_PIN + i));
+    }
+}
+
+char Keypad_GetKey(void)
+{
+    static const char keys[4][4] = {
+        {'1', '2', '3', 'A'},
+        {'4', '5', '6', 'B'},
+        {'7', '8', '9', 'C'},
+        {'*', '0', '#', 'D'}
+    };
+
+    for (int r = 0; r < 4; r++)
+    {
+        PTB->PCOR = (1u << (KP_ROW0_PIN + r));
+        Delay_us(10);
+        for (int c = 0; c < 4; c++)
+        {
+            uint32_t colMask = (1u << (KP_COL0_PIN + c));
+            if (!(PTB->PDIR & colMask))
+            {
+                Delay_ms(20);
+                if (PTB->PDIR & colMask) continue;
+                while (!(PTB->PDIR & colMask)) {}
+                Delay_ms(20);
+                PTB->PSOR = (1u << (KP_ROW0_PIN + r));
+                return keys[r][c];
+            }
+        }
+        PTB->PSOR = (1u << (KP_ROW0_PIN + r));
+    }
+    return '\0';
+}
+
+/* ============================================================
+ *                    FUNCIONES LCD Y I2C/MAX7219
+ * ============================================================ */
+void LCD_GPIO_Init(void) {
+    SIM->SCGC5 |= SIM_SCGC5_PORTA_MASK | SIM_SCGC5_PORTC_MASK;
+    PORTA->PCR[LCD_RS_PIN] = PORT_PCR_MUX(1);
+    PORTA->PCR[LCD_EN_PIN] = PORT_PCR_MUX(1);
+    for(int i=0; i<=3; i++) PORTC->PCR[i] = PORT_PCR_MUX(1);
+    PTA->PDDR |= (1 << LCD_RS_PIN) | (1 << LCD_EN_PIN);
+    PTC->PDDR |= 0x0F;
+}
+
+void LCD_Send4Bits(uint8_t val) {
+    PTC->PCOR = 0x0F;
+    if (val & 0x01) PTC->PSOR = (1 << 0);
+    if (val & 0x02) PTC->PSOR = (1 << 1);
+    if (val & 0x04) PTC->PSOR = (1 << 2);
+    if (val & 0x08) PTC->PSOR = (1 << 3);
+    PTA->PSOR = (1 << LCD_EN_PIN); Delay_us(2);
+    PTA->PCOR = (1 << LCD_EN_PIN); Delay_us(50);
+}
+
+void LCD_SendCommand(uint8_t cmd) {
+    PTA->PCOR = (1 << LCD_RS_PIN);
+    LCD_Send4Bits(cmd >> 4); LCD_Send4Bits(cmd & 0x0F);
+    Delay_ms(cmd <= 2 ? 2 : 1);
+}
+
+void LCD_SendData(uint8_t data) {
+    PTA->PSOR = (1 << LCD_RS_PIN);
+    LCD_Send4Bits(data >> 4); LCD_Send4Bits(data & 0x0F);
+}
+
+void LCD_Init(void) {
+    LCD_GPIO_Init(); Delay_ms(40);
+    PTA->PCOR = (1 << LCD_RS_PIN) | (1 << LCD_EN_PIN);
+    LCD_Send4Bits(0x03); Delay_ms(5);
+    LCD_Send4Bits(0x03); Delay_us(150);
+    LCD_Send4Bits(0x03); Delay_us(150);
+    LCD_Send4Bits(0x02); Delay_us(150);
+    LCD_SendCommand(0x28); LCD_SendCommand(0x0C); LCD_SendCommand(0x06); LCD_SendCommand(0x01); Delay_ms(2);
+}
+
+void LCD_Clear(void) { LCD_SendCommand(0x01); Delay_ms(2); }
+void LCD_SetCursor(uint8_t r, uint8_t c) { LCD_SendCommand(0x80 | ((r == 0 ? 0x00 : 0x40) + c)); }
+void LCD_WriteString(const char *s) { while (*s) LCD_SendData((uint8_t)*s++); }
+
+void LCD_WriteLine(uint8_t row, const char *s) {
+    char line[17];
+    snprintf(line, sizeof(line), "%-16s", s);
+    LCD_SetCursor(row, 0);
+    LCD_WriteString(line);
+}
+
+void Delay_us(uint32_t us) { for(uint32_t i=0; i<us; i++) for(uint32_t j=0; j<8; j++) __NOP(); }
+void Delay_ms(uint32_t ms) { for(uint32_t i=0; i<ms; i++) Delay_us(1000); }
+
+uint8_t BCD_To_Decimal(uint8_t b) { return ((b >> 4) * 10) + (b & 0x0F); }
+uint8_t Decimal_To_BCD(uint8_t d) { return ((d / 10) << 4) | (d % 10); }
+
+#define SCL_LOW()    do { PTC->PCOR = (1u << 8); PTC->PDDR |=  (1u << 8); } while (0)
+#define SCL_HIGH()   do { PTC->PDDR &= ~(1u << 8); } while (0)
+#define SDA_LOW()    do { PTC->PCOR = (1u << 9); PTC->PDDR |=  (1u << 9); } while (0)
+#define SDA_HIGH()   do { PTC->PDDR &= ~(1u << 9); } while (0)
+#define SDA_READ()   ((PTC->PDIR >> 9) & 1u)
+
+static void I2C_BusRecover(void) {
+    uint8_t i;
+    SIM->SCGC5 |= SIM_SCGC5_PORTC_MASK;
+    PORTC->PCR[8] = PORT_PCR_MUX(1) | PORT_PCR_PE_MASK | PORT_PCR_PS_MASK;
+    PORTC->PCR[9] = PORT_PCR_MUX(1) | PORT_PCR_PE_MASK | PORT_PCR_PS_MASK;
+    SCL_HIGH(); SDA_HIGH(); Delay_us(20);
+    for (i = 0; i < 9; i++) {
+        if (SDA_READ()) break;
+        SCL_LOW(); Delay_us(20); SCL_HIGH(); Delay_us(20);
+    }
+    SDA_LOW(); Delay_us(20); SCL_HIGH(); Delay_us(20); SDA_HIGH(); Delay_us(20);
+}
+
+void I2C0_Init(void) {
+    SIM->SCGC4 |= SIM_SCGC4_I2C0_MASK;
+    SIM->SCGC5 |= SIM_SCGC5_PORTC_MASK | SIM_SCGC5_PORTE_MASK;
+    I2C0->C1 = 0x00;
+    PORTE->PCR[24] = PORT_PCR_MUX(0);
+    PORTE->PCR[25] = PORT_PCR_MUX(0);
+    I2C_BusRecover();
+    PORTC->PCR[8] = PORT_PCR_MUX(2) | PORT_PCR_PE_MASK | PORT_PCR_PS_MASK;
+    PORTC->PCR[9] = PORT_PCR_MUX(2) | PORT_PCR_PE_MASK | PORT_PCR_PS_MASK;
+    I2C0->F  = 0x1F;
+    I2C0->C1 = I2C_C1_IICEN_MASK;
+    I2C0->S = I2C_S_IICIF_MASK | I2C_S_ARBL_MASK;
+}
+
+static uint8_t I2C_WaitIICIF(void) {
+    uint32_t t = I2C_TIMEOUT;
+    while ((I2C0->S & I2C_S_IICIF_MASK) == 0) { if (--t == 0) return 0; }
+    I2C0->S = I2C_S_IICIF_MASK; return 1;
+}
+
+static uint8_t I2C_WaitBusIdle(void) {
+    uint32_t t = I2C_TIMEOUT;
+    while (I2C0->S & I2C_S_BUSY_MASK) { if (--t == 0) return 0; }
+    return 1;
+}
+
+static uint8_t I2C_Start(void) {
+    if (I2C0->S & I2C_S_ARBL_MASK) I2C0->S = I2C_S_ARBL_MASK;
+    if (!I2C_WaitBusIdle()) { I2C0_Init(); if (!I2C_WaitBusIdle()) return 0; }
+    I2C0->C1 |= I2C_C1_TX_MASK | I2C_C1_MST_MASK; return 1;
+}
+
+static void I2C_Stop(void) {
+    I2C0->C1 &= ~(I2C_C1_MST_MASK | I2C_C1_TX_MASK | I2C_C1_TXAK_MASK);
+    I2C_WaitBusIdle();
+}
+
+static uint8_t I2C_WriteByte(uint8_t data) {
+    I2C0->D = data; if (!I2C_WaitIICIF()) return 0;
+    if (I2C0->S & I2C_S_RXAK_MASK) return 0;
+    return 1;
+}
+
+static uint8_t I2C_ReadBytes(uint8_t *buf, uint8_t len) {
+    I2C0->C1 &= ~I2C_C1_TX_MASK;
+    if (len == 1) I2C0->C1 |= I2C_C1_TXAK_MASK; else I2C0->C1 &= ~I2C_C1_TXAK_MASK;
+    (void)I2C0->D;
+    for (uint8_t i = 0; i < len; i++) {
+        if (!I2C_WaitIICIF()) { I2C_Stop(); return 0; }
+        if ((len >= 2) && (i == (uint8_t)(len - 2))) I2C0->C1 |= I2C_C1_TXAK_MASK;
+        if (i == (uint8_t)(len - 1)) {
+            I2C0->C1 &= ~(I2C_C1_MST_MASK | I2C_C1_TXAK_MASK);
+            buf[i] = I2C0->D; I2C_WaitBusIdle();
+        } else { buf[i] = I2C0->D; }
+    }
+    return 1;
+}
+
+uint8_t I2C_Probe(uint8_t addr7) {
+    if (!I2C_Start()) return 0;
+    uint8_t ok = I2C_WriteByte((uint8_t)(addr7 << 1));
+    I2C_Stop(); return ok;
+}
+
+uint8_t DS3231_WriteRegisters(uint8_t reg, const uint8_t *data, uint8_t len) {
+    if (!I2C_Start()) return 0;
+    if (!I2C_WriteByte(DS3231_I2C_ADDR << 1)) { I2C_Stop(); return 0; }
+    if (!I2C_WriteByte(reg))                  { I2C_Stop(); return 0; }
+    for (uint8_t i = 0; i < len; i++) { if (!I2C_WriteByte(data[i])) { I2C_Stop(); return 0; } }
+    I2C_Stop(); return 1;
+}
+
+uint8_t DS3231_ReadRegisters(uint8_t reg, uint8_t *buf, uint8_t len) {
+    if (!I2C_Start()) return 0;
+    if (!I2C_WriteByte(DS3231_I2C_ADDR << 1)) { I2C_Stop(); return 0; }
+    if (!I2C_WriteByte(reg))                  { I2C_Stop(); return 0; }
+    I2C0->C1 |= I2C_C1_RSTA_MASK;
+    if (!I2C_WriteByte((DS3231_I2C_ADDR << 1) | 1)) { I2C_Stop(); return 0; }
+    return I2C_ReadBytes(buf, len);
+}
+
+uint8_t DS3231_Init(void) {
+    uint8_t control = 0x1C; uint8_t status = 0x00;
+    if (!DS3231_WriteRegisters(DS3231_REG_CONTROL, &control, 1)) return 0;
+    if (!DS3231_WriteRegisters(DS3231_REG_STATUS,  &status,  1)) return 0;
+    return 1;
+}
+
+uint8_t DS3231_SetDateTime(const DateTime *dt) {
+    uint8_t regs[7];
+    regs[0] = Decimal_To_BCD(dt->seconds);
+    regs[1] = Decimal_To_BCD(dt->minutes);
+    regs[2] = Decimal_To_BCD(dt->hours);
+    regs[3] = 1;
+    regs[4] = Decimal_To_BCD(dt->day);
+    regs[5] = Decimal_To_BCD(dt->month);
+    regs[6] = Decimal_To_BCD(dt->year);
+    return DS3231_WriteRegisters(0x00, regs, 7);
+}
+
+uint8_t DS3231_ReadDateTime(DateTime *dt) {
+    uint8_t regs[7];
+    if (!DS3231_ReadRegisters(0x00, regs, 7)) return 0;
+    dt->seconds = BCD_To_Decimal(regs[0] & 0x7F);
+    dt->minutes = BCD_To_Decimal(regs[1] & 0x7F);
+    dt->hours   = BCD_To_Decimal(regs[2] & 0x3F);
+    dt->day     = BCD_To_Decimal(regs[4] & 0x3F);
+    dt->month   = BCD_To_Decimal(regs[5] & 0x1F);
+    dt->year    = BCD_To_Decimal(regs[6]);
+    return 1;
+}
+
+void SPI0_Init(void) {
+    SIM->SCGC4 |= SIM_SCGC4_SPI0_MASK; SIM->SCGC5 |= SIM_SCGC5_PORTD_MASK;
+    PORTD->PCR[1] = PORT_PCR_MUX(2); PORTD->PCR[2] = PORT_PCR_MUX(2);
+    PORTD->PCR[MAX_CS_PIN] = PORT_PCR_MUX(1);
+    PTD->PSOR = (1u << MAX_CS_PIN); PTD->PDDR |= (1u << MAX_CS_PIN);
+    SPI0->C1 = 0x00; SPI0->C2 = 0x00;
+    SPI0->BR = SPI_BR_SPPR(2) | SPI_BR_SPR(1);
+    SPI0->C1 = SPI_C1_SPE_MASK | SPI_C1_MSTR_MASK;
+}
+
+uint8_t SPI0_Transfer(uint8_t data) {
+    uint32_t t = I2C_TIMEOUT;
+    while (((SPI0->S & SPI_S_SPTEF_MASK) == 0) && (--t != 0)) {}
+    SPI0->D = data;
+    t = I2C_TIMEOUT;
+    while (((SPI0->S & SPI_S_SPRF_MASK) == 0) && (--t != 0)) {}
+    return SPI0->D;
+}
+
+void MAX7219_Write(uint8_t reg, uint8_t value) {
+    PTD->PCOR = (1u << MAX_CS_PIN);
+    (void)SPI0_Transfer(reg); (void)SPI0_Transfer(value);
+    PTD->PSOR = (1u << MAX_CS_PIN);
+}
+
+void MAX7219_Clear(void) {
+    for (uint8_t i = 0; i < MAX_NUM_DIGITS; i++) MAX7219_Write(0x01 + i, 0x0F);
+}
+
+void MAX7219_Init(void) {
+    SPI0_Init();
+    MAX7219_Write(MAX_REG_SHUTDOWN, 0x00);
+    MAX7219_Write(MAX_REG_TEST,     0x00);
+    MAX7219_Write(MAX_REG_SCANLIMIT, 3);
+    MAX7219_Write(MAX_REG_DECODE,   0x0F);
+    MAX7219_Write(MAX_REG_INTENSITY, 0x08);
+    MAX7219_Clear();
+    MAX7219_Write(MAX_REG_SHUTDOWN, 0x01);
+}
+
+void MAX7219_ShowTime(uint8_t hours, uint8_t minutes, uint8_t sep) {
+    uint8_t d[4];
+    d[0] = hours / 10; d[1] = hours % 10;
+    d[2] = minutes / 10; d[3] = minutes % 10;
+    if (sep) d[1] |= MAX_DP;
+    for (uint8_t i = 0; i < 4; i++) MAX7219_Write(0x01 + i, d[i]);
+}
+
+static char InputDigit(uint8_t i) { return (i < bufferIndex) ? inputBuffer[i] : '_'; }
+static uint8_t InputPair(uint8_t i) { return (uint8_t)((inputBuffer[i] - '0') * 10 + (inputBuffer[i + 1] - '0')); }
+
+/* Dibuja la pantalla de ingreso de datos */
+static void ShowConfigScreen(void) {
+    char line[17];
+    if (currentMode == MODE_CONFIG_TIME) {
+        LCD_WriteLine(0, "SET TIME  HH:MM");
+        snprintf(line, sizeof(line), "%c%c:%c%c", InputDigit(0), InputDigit(1), InputDigit(2), InputDigit(3));
+    } else if (currentMode == MODE_CONFIG_DATE) {
+        LCD_WriteLine(0, "SET DATE");
+        snprintf(line, sizeof(line), "%c%c/%c%c/%c%c", InputDigit(0), InputDigit(1), InputDigit(2), InputDigit(3), InputDigit(4), InputDigit(5));
+    } else if (currentMode == MODE_CONFIG_ALARM) {
+        LCD_WriteLine(0, "ALARM SET");
+        snprintf(line, sizeof(line), "%c%c:%c%c", InputDigit(0), InputDigit(1), InputDigit(2), InputDigit(3));
+    } else if (currentMode == MODE_CONFIG_TEMP_LIMIT) {
+        LCD_WriteLine(0, "SET TEMP LIMIT");
+        snprintf(line, sizeof(line), "%c%c C", InputDigit(0), InputDigit(1));
+    }
+    LCD_WriteLine(1, line);
+}
+
+/* Dibuja el Menú de Configuración actualizado */
+static void ShowMenuScreen(void) {
+    char buf[17];
+    LCD_Clear();
+    /* Muestra la opción 4 actualizando si está ON u OFF */
+    snprintf(buf, sizeof(buf), "1Tm 2Dt 3Al %s", alarmEnabled ? "4ON " : "4OFF");
+    LCD_WriteLine(0, buf);
+    /* La opción 5 nos permite modificar el Threshold e indica su valor actual */
+    snprintf(buf, sizeof(buf), "5:Lmt[%02uC] C:Ex", tempLimit);
+    LCD_WriteLine(1, buf);
+}
+
+static void ShowMessage(const char *l1, const char *l2, uint32_t ms) {
+    LCD_Clear(); LCD_WriteLine(0, l1); LCD_WriteLine(1, l2); Delay_ms(ms);
+}
+
+static void StartInput(SystemMode mode) {
+    currentMode = mode; bufferIndex = 0; memset(inputBuffer, 0, sizeof(inputBuffer));
+    LCD_Clear(); ShowConfigScreen();
+}
+
+static uint8_t DaysInMonth(uint8_t month, uint8_t year) {
+    static const uint8_t days[12] = { 31,28,31,30,31,30,31,31,30,31,30,31 };
+    if (month == 2 && (year % 4) == 0) return 29;
+    if (month >= 1 && month <= 12) return days[month - 1];
+    return 31;
+}
+
+/* ============================================================
+ *                    ADC PARA TEMPERATURA
+ * ============================================================ */
+void ADC0_Init(void) {
+    SIM->SCGC6 |= SIM_SCGC6_ADC0_MASK;
+    SIM->SCGC5 |= SIM_SCGC5_PORTE_MASK;
+    PORTE->PCR[20] = PORT_PCR_MUX(0);
+    ADC0->CFG1 = ADC_CFG1_MODE(1) | ADC_CFG1_ADIV(1) | ADC_CFG1_ADICLK(0);
+    ADC0->SC2 = 0x00;
+    ADC0->SC3 = 0x00;
+}
+
+uint16_t ADC0_Read(void) {
+    ADC0->SC1[0] = 0x00;
+    while ((ADC0->SC1[0] & ADC_SC1_COCO_MASK) == 0) {}
+    return ADC0->R[0];
+}
+
+/* ============================================================
+ *                    MAIN Y MAQUINA DE ESTADOS
+ * ============================================================ */
+int main(void)
+{
+    DateTime dt;
+    char buffer1[17], buffer2[17];
+    uint8_t lastSec = 0xFF;
+    uint8_t maxLen;
+
+    LCD_Init();
+    Keypad_Init();
+    MAX7219_Init();
+    I2C0_Init();
+    Alarm_Hardware_Init();
+    ADC0_Init();
+
+    while (!I2C_Probe(DS3231_I2C_ADDR)) {
+        ShowMessage("DS3231 NO ACK", "Revisa SDA/SCL", 1000); I2C0_Init();
+    }
+
+    if (!DS3231_Init()) { ShowMessage("DS3231", "INIT ERROR", 0); while (1) {} }
+
+    DS3231_SetAlarm1(alarmHours, alarmMinutes);
+
+    ShowMessage("Station Ready", "* = Config Menu", 2000);
+    LCD_Clear();
+
+    while (1)
+    {
+        /* MODO ALARMA DS3231: Activa la interrupción normal del reloj */
+        if (alarmFiredFlag && currentMode != MODE_ALARM_TRIGGERED && alarmEnabled)
+        {
+            currentMode = MODE_ALARM_TRIGGERED;
+            PTC->PSOR = (1u << BUZZER_PIN);
+            PTB->PCOR = (1u << LED_ALARM_PIN);
+            LCD_Clear();
+            LCD_WriteLine(0, "*** ALARM ***");
+            LCD_WriteLine(1, "Press # to stop");
+        }
+
+        char key = Keypad_GetKey();
+
+        switch (currentMode)
+        {
+            case MODE_NORMAL:
+                if (key == '*') {
+                    currentMode = MODE_MENU;
+                    ShowMenuScreen();
+                    break;
+                }
+
+                if (!DS3231_ReadDateTime(&dt)) {
+                    LCD_WriteLine(0, "READ ERROR"); LCD_WriteLine(1, ""); I2C0_Init(); lastSec = 0xFF; break;
+                }
+
+                if (dt.seconds != lastSec) {
+                    lastSec = dt.seconds;
+                    MAX7219_ShowTime(dt.hours, dt.minutes, (uint8_t)(dt.seconds & 1u));
+
+                    uint16_t raw_adc = ADC0_Read();
+                    uint32_t temp_x10 = TEMP_MIN_X10 + ((uint32_t)raw_adc * (TEMP_MAX_X10 - TEMP_MIN_X10)) / 4095;
+                    uint8_t temp_int = temp_x10 / 10;
+                    uint8_t temp_dec = temp_x10 % 10;
+
+                    /* --------------------------------------------------------
+                     * EXTRA CHALLENGE 3: Comparar la temperatura continuamente
+                     * -------------------------------------------------------- */
+                    if (temp_int >= tempLimit) {
+                        PTC->PSOR = (1u << BUZZER_PIN);       /* Enciende Buzzer */
+                        PTB->PCOR = (1u << LED_ALARM_PIN);    /* Enciende LED */
+
+                        /* Muestra mensaje de advertencia exacto solicitado */
+                        snprintf(buffer1, sizeof(buffer1), "Temp: %2u.%1u C", temp_int, temp_dec);
+                        LCD_WriteLine(0, buffer1);
+                        LCD_WriteLine(1, "WARNING!        ");
+                    } else {
+                        /* Apaga actuadores si la temp bajó (y no está sonando la alarma normal) */
+                        if (!alarmFiredFlag) {
+                            PTC->PCOR = (1u << BUZZER_PIN);
+                            PTB->PSOR = (1u << LED_ALARM_PIN);
+                        }
+
+                        snprintf(buffer1, sizeof(buffer1), "%02u/%02u/%02u T:%2u.%1uC",
+                                 (unsigned)dt.day, (unsigned)dt.month, (unsigned)dt.year, temp_int, temp_dec);
+                        snprintf(buffer2, sizeof(buffer2), "Alm: %02u:%02u   %3s",
+                                 (unsigned)alarmHours, (unsigned)alarmMinutes, alarmEnabled ? "ON" : "OFF");
+
+                        LCD_WriteLine(0, buffer1);
+                        LCD_WriteLine(1, buffer2);
+                    }
+                }
+                break;
+
+            case MODE_MENU:
+                if (key == '1') {
+                    StartInput(MODE_CONFIG_TIME);
+                } else if (key == '2') {
+                    StartInput(MODE_CONFIG_DATE);
+                } else if (key == '3') {
+                    StartInput(MODE_CONFIG_ALARM);
+                } else if (key == '4') {
+                    alarmEnabled = !alarmEnabled;
+                    DS3231_SetAlarm1(alarmHours, alarmMinutes);
+                    ShowMenuScreen();
+                } else if (key == '5') {
+                    StartInput(MODE_CONFIG_TEMP_LIMIT);
+                } else if (key == 'C') {
+                    currentMode = MODE_NORMAL;
+                    LCD_Clear();
+                    lastSec = 0xFF;
+                }
+                break;
+
+            case MODE_ALARM_TRIGGERED:
+                if (key == '#') {
+                    uint8_t status;
+                    alarmFiredFlag = 0;
+                    PTC->PCOR = (1u << BUZZER_PIN);
+                    PTB->PSOR = (1u << LED_ALARM_PIN);
+
+                    if (DS3231_ReadRegisters(DS3231_REG_STATUS, &status, 1)) {
+                        status &= ~0x01;
+                        DS3231_WriteRegisters(DS3231_REG_STATUS, &status, 1);
+                    }
+                    currentMode = MODE_NORMAL;
+                    LCD_Clear();
+                    lastSec = 0xFF;
+                }
+                break;
+
+            case MODE_CONFIG_TIME:
+            case MODE_CONFIG_DATE:
+            case MODE_CONFIG_ALARM:
+            case MODE_CONFIG_TEMP_LIMIT:
+                if (currentMode == MODE_CONFIG_DATE) maxLen = 6;
+                else if (currentMode == MODE_CONFIG_TEMP_LIMIT) maxLen = 2; /* Límite de temp de 2 dígitos */
+                else maxLen = 4;
+
+                if (key == '\0') break;
+
+                if (key >= '0' && key <= '9' && bufferIndex < maxLen) {
+                    inputBuffer[bufferIndex++] = key;
+                    ShowConfigScreen();
+                }
+                else if (key == 'B' && bufferIndex > 0) {
+                    inputBuffer[--bufferIndex] = '\0';
+                    ShowConfigScreen();
+                }
+                else if (key == 'C') {
+                    currentMode = MODE_NORMAL;
+                    ShowMessage("Cancelado", "", 800);
+                    LCD_Clear(); lastSec = 0xFF;
+                }
+                else if (key == '#') {
+                    if (bufferIndex < maxLen) {
+                        ShowMessage("Faltan digitos", "", 800); LCD_Clear(); ShowConfigScreen();
+                    }
+                    else if (currentMode == MODE_CONFIG_TIME) {
+                        uint8_t h = InputPair(0); uint8_t m = InputPair(2);
+                        if (h > 23 || m > 59) {
+                            ShowMessage("Hora invalida", "", 1200); StartInput(MODE_CONFIG_TIME);
+                        } else {
+                            DS3231_ReadDateTime(&dt);
+                            dt.hours = h; dt.minutes = m; dt.seconds = 0;
+                            DS3231_SetDateTime(&dt);
+                            currentMode = MODE_NORMAL;
+                            ShowMessage("Time Saved", "", 1000); LCD_Clear(); lastSec = 0xFF;
+                        }
+                    }
+                    else if (currentMode == MODE_CONFIG_DATE) {
+                        uint8_t d = InputPair(0); uint8_t m = InputPair(2); uint8_t y = InputPair(4);
+                        if (m < 1 || m > 12 || d < 1 || d > DaysInMonth(m, y)) {
+                            ShowMessage("Fecha invalida", "", 1200); StartInput(MODE_CONFIG_DATE);
+                        } else {
+                            DS3231_ReadDateTime(&dt);
+                            dt.day = d; dt.month = m; dt.year = y;
+                            DS3231_SetDateTime(&dt);
+                            currentMode = MODE_NORMAL;
+                            ShowMessage("Date Saved", "", 1000); LCD_Clear(); lastSec = 0xFF;
+                        }
+                    }
+                    else if (currentMode == MODE_CONFIG_ALARM) {
+                        alarmHours = InputPair(0); alarmMinutes = InputPair(2);
+                        if (alarmHours > 23 || alarmMinutes > 59) {
+                            ShowMessage("Hora invalida", "", 1200); StartInput(MODE_CONFIG_ALARM);
+                        } else {
+                            DS3231_SetAlarm1(alarmHours, alarmMinutes);
+                            currentMode = MODE_NORMAL;
+                            ShowMessage("Alarm Saved", "", 1000); LCD_Clear(); lastSec = 0xFF;
+                        }
+                    }
+                    else if (currentMode == MODE_CONFIG_TEMP_LIMIT) {
+                        tempLimit = InputPair(0);
+                        currentMode = MODE_NORMAL;
+                        ShowMessage("Limit Saved", "", 1000); LCD_Clear(); lastSec = 0xFF;
+                    }
+                }
+                break;
+        }
+        Delay_ms(5);
+    }
+}
