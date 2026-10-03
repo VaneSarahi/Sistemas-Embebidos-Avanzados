@@ -1952,7 +1952,10 @@ Problemas que aparecieron durante el desarrollo, y su solución:
 
 ## 👥 Autores
 
-_Agrega aquí los nombres del equipo_ 
+* **Vanessa Sarahí Salazar Ibarra A01646141**
+* **Ana Cristina Chavez Acosta A01742237**
+* **Angeles Araiza García A00574806**
+
 · Serial Interfaces Lab · Práctica 3
 
 <div align="center">
