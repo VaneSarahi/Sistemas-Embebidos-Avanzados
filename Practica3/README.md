@@ -45,7 +45,6 @@
 10. [Lecciones aprendidas](#-lecciones-aprendidas)
 11. [Pendientes y mejoras](#-pendientes-y-mejoras)
 12. [Archivos del proyecto](#-archivos-del-proyecto)
-13. [Compilar y cargar](#-compilar-y-cargar)
 
 ---
 
@@ -1936,17 +1935,6 @@ Problemas que aparecieron durante el desarrollo, y su solución:
 | `I2C_Step6` | Paso 6: estación completa (menú, alarma ON/OFF) |
 | `I2C_Extra3` | Paso 6 + **Reto 3** (umbral de temperatura) |
 | `I2C_Extra5` | Paso 6 + **Reto 5** (LDR por ADC) |
-
----
-
-## ⚡ Compilar y cargar
-
-1. Crear un proyecto para la **KL25Z (`MKL25Z4`)** en tu IDE (por ejemplo MCUXpresso IDE o Kinetis Design Studio).
-2. Copiar el contenido del archivo que quieras probar como `main.c`.
-3. Compilar y cargar a la FRDM‑KL25Z por **OpenSDA** (USB).
-4. Alimentación: DS3231 a **3.3 V**; LCD y MAX7219 a **5 V**; **GND común** para todos los módulos.
-
-> 💡 `snprintf` requiere la biblioteca estándar; los formatos usados son enteros (`%u`, `%02u`) y cadenas.
 
 ---
 
