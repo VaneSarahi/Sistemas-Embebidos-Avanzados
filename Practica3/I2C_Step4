@@ -1,17 +1,10 @@
+//Step 4: DS3231 Alarma + Interrupcion + Keypad + LCD
+
 #include "MKL25Z4.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
-/* ============================================================
- *  Practica 3 - Paso 4: DS3231 Alarma + Interrupcion + Keypad + LCD
- * ============================================================
- *  LCD    : RS PTA1, EN PTA2, D4-D7 PTC0-PTC3
- *  DS3231 : SCL PTC8, SDA PTC9, INT/SQW -> PTD4 (PORTD tiene interrupcion de pin)
- *  MAX7219: CS PTD0, CLK PTD1, DIN PTD2
- *  Keypad : filas PTB0-PTB3, columnas PTB8-PTB11
- *  Buzzer : PTC11      LED rojo de la placa: PTB18 (activo en bajo)
- * ============================================================ */
 
 #define LCD_RS_PIN      1
 #define LCD_EN_PIN      2
@@ -26,7 +19,7 @@
 #define DS3231_REG_CONTROL 0x0E
 #define DS3231_REG_STATUS  0x0F
 
-/* ---------- MAX7219 ---------- */
+//MAX7219
 #define MAX_CS_PIN         0
 #define MAX_REG_DIGIT0     0x01
 #define MAX_REG_DECODE     0x09
@@ -39,16 +32,16 @@
 #define MAX_DP             0x80
 #define MAX_REVERSE_DIGITS 0
 
-/* ---------- KEYPAD ---------- */
+// KEYPAD
 #define KP_ROW0_PIN        0      /* PTB0..PTB3  = filas */
 #define KP_COL0_PIN        8      /* PTB8..PTB11 = columnas */
 
-/* ---------- ALARM & ACTUATORS ---------- */
+// ALARM & ACTUATORS
 #define ALARM_INT_PIN      4      /* PTD4 - INT/SQW del DS3231 (PORTD si genera IRQ) */
 #define BUZZER_PIN         11     /* PTC11 */
 #define LED_ALARM_PIN      18     /* PTB18 - LED rojo de la placa (activo en bajo) */
 
-/* ---------- MODOS DEL SISTEMA ---------- */
+// MODOS DEL SISTEMA
 typedef enum {
     MODE_NORMAL = 0,
     MODE_CONFIG_TIME,
@@ -93,9 +86,7 @@ uint8_t DS3231_ReadRegisters(uint8_t reg, uint8_t *buf, uint8_t len);
 void MAX7219_Init(void);
 void MAX7219_ShowTime(uint8_t hours, uint8_t minutes, uint8_t sep);
 
-/* ============================================================
- *                    ALARMA Y GPIOs
- * ============================================================ */
+// ALARMA Y GPIOs
 void Alarm_Hardware_Init(void)
 {
     SIM->SCGC5 |= SIM_SCGC5_PORTB_MASK | SIM_SCGC5_PORTC_MASK | SIM_SCGC5_PORTD_MASK;
@@ -158,9 +149,8 @@ uint8_t DS3231_SetAlarm1(uint8_t hours, uint8_t minutes)
     return 1;
 }
 
-/* ============================================================
- *                    TECLADO MATRICIAL (KEYPAD)
- * ============================================================ */
+// TECLADO MATRICIAL (KEYPAD)
+
 void Keypad_Init(void)
 {
     SIM->SCGC5 |= SIM_SCGC5_PORTB_MASK;
@@ -177,7 +167,7 @@ void Keypad_Init(void)
     }
 }
 
-/* No bloqueante: devuelve '\0' si no hay tecla. Si hay, espera a que se suelte. */
+/* No bloqueante: devuelve \0 si no hay tecla. Si hay, espera a que se suelte. */
 char Keypad_GetKey(void)
 {
     static const char keys[4][4] = {
@@ -213,9 +203,7 @@ char Keypad_GetKey(void)
     return '\0';
 }
 
-/* ============================================================
- *                    FUNCIONES LCD Y I2C/MAX7219
- * ============================================================ */
+// FUNCIONES LCD Y I2C/MAX7219
 void LCD_GPIO_Init(void) {
     SIM->SCGC5 |= SIM_SCGC5_PORTA_MASK | SIM_SCGC5_PORTC_MASK;
     PORTA->PCR[LCD_RS_PIN] = PORT_PCR_MUX(1);
@@ -491,9 +479,8 @@ static uint8_t DaysInMonth(uint8_t month, uint8_t year) {
     return 31;
 }
 
-/* ============================================================
- *                    MAIN Y MAQUINA DE ESTADOS
- * ============================================================ */
+// MAIN Y MAQUINA DE ESTADOS
+
 int main(void)
 {
     DateTime dt;
